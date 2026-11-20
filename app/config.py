@@ -16,6 +16,9 @@ class Settings:
     IDEMPOTENCY_STALE_SECONDS: int = int(
         os.getenv("IDEMPOTENCY_STALE_SECONDS", "60")
     )
+    # A report referencing more observations than this is not eligible for
+    # the clerk-driven reassignment API.
+    MAX_REASSIGN_OBSERVATIONS: int = int(os.getenv("MAX_REASSIGN_OBSERVATIONS", "8"))
 
 
 settings = Settings()

@@ -121,6 +121,62 @@ Content-Type: application/json
 | GET | `/diagnostic-reports/{id}/_history` | 报告全部历史版本 |
 | GET | `/patients/{id}/_history` | 患者历史版本 |
 
+## 3.1 报告转挂（更正挂错患者的报告）
+
+数据员核对发现报告挂错患者时，调用：
+
+```
+POST /diagnostic-reports/{report_id}/reassign
+Content-Type: application/json
+
+{
+  "expectedVersion": 1,                  // 核对时看到的报告版本，也接受 ETag 字符串 "W/\"1\""
+  "targetPatientId": "<正确PatientId>" // 正确的患者 ID
+}
+```
+
+规则：
+
+1. **只受理引用不超过 8 条观测的报告**（可用 `MAX_REASSIGN_OBSERVATIONS` 调整），
+   超限 → `422`。
+2. **只被本报告引用的观测保留原 ID**，随报告一起改挂到目标患者（观测版本 +1）。
+3. **被其他报告共享的观测不移动**：按当前内容为目标患者复制一条新观测（新 ID、
+   版本 1），本报告改引副本，其他报告仍引用原观测。
+4. 报告正文（subject/result/meta）、`report_links` 关联与所有新资源版本在**同一
+   事务**提交；历史版本（`/_history`）继续可查。
+5. **回执**列出每条观测更正前后的 ID：
+
+```json
+{
+  "receipt": "diagnostic-report-reassign",
+  "reportId": "<报告id>",
+  "reportVersion": 2,
+  "reportEtag": "W/\"2\"",
+  "fromPatientId": "<原患者id>",
+  "toPatientId": "<目标患者id>",
+  "observations": [
+    {"action": "copied", "beforeId": "<原观测id>", "afterId": "<副本id>", "version": 1},
+    {"action": "moved",  "beforeId": "<观测id>",  "afterId": "<观测id>",  "version": 2}
+  ]
+}
+```
+
+6. **版本过期**（`expectedVersion` 与当前报告版本不一致）→ `412`，拒绝转挂；
+   成功后同一版本号重试也会得到 `412`，即转挂天然只生效一次。
+7. **失败不留痕**：任何校验/并发失败都整体回滚，不会留下副本、新版本或关联
+   变更。
+8. **并发语义**：转挂先按 id 升序锁定相关观测行、再锁报告行（与 `POST /fhir`
+   管线一致的加锁顺序），因此与“同时更正这些观测的 Bundle”或“同时新增引用的
+   Bundle”在 PostgreSQL 中的提交结果等同于某种依次执行；若数据库检测到死锁/
+   锁冲突，本次转挂返回 `409`，重新读取报告后重试即可。
+
+目标患者不存在 → `404`；报告不存在 → `404`；目标患者即当前患者 → `422`；
+请求体缺字段/类型错误 → `422`（OperationOutcome）。
+
+演示：`docker compose up --build` 后打开 <http://localhost:8000/docs>，在
+`reassign` 分组下直接试用；或运行 `./scripts/demo_reassign.sh` 查看完整命令行
+演示（建患 → 建报告 → 版本过期拒绝 → 转挂 → 回执与历史核对）。
+
 ## 4. 业务规则与失败语义
 
 1. **条目上限 20**，仅允许 `Patient / Observation / DiagnosticReport`；
@@ -164,11 +220,13 @@ app/
   models.py          ORM（患者/标识/观测/报告/关联/版本/幂等账本，PG JSONB）
   errors.py          OperationOutcome 错误体系
   fhir_utils.py      ETag/版本工具
-  routers/           /fhir 提交与资源读取路由
+  routers/           /fhir 提交、转挂与资源读取路由
   services/
     bundle.py        Bundle 校验、幂等、事务处理、患者一致性规则
+    reassign.py      报告转挂（移动/复制、版本校验、并发序列化）
     queries.py       读取与历史查询
 scripts/entrypoint.sh  容器启动（等库+建表）
-tests/               25 个 pytest 用例（含并发、重启、原子性）
+scripts/demo_reassign.sh  转挂端到端演示脚本
+tests/               pytest 用例（含并发、重启、原子性、转挂）
 docker-compose.yml   db + api 两服务，含健康检查
 ```
